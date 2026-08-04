@@ -4,6 +4,8 @@ import psycopg2.extensions
 from psycopg2.extras import RealDictCursor
 import select
 import json
+import math
+import time
 from datetime import datetime
 from pinecone import AwsRegion, CloudProvider, Pinecone, ServerlessSpec
 from openai import OpenAI
@@ -19,9 +21,86 @@ JOB_INDEX_NAME = os.getenv("JOB_INDEX_NAME", "jobs")
 EMBEDDING_DIM = 1536
 PRODUCT_EMBEDDING_DIM = 1024
 PRODUCT_BATCH_SIZE = 96
+JOB_EMBEDDING_DIM = 1024
+JOB_BATCH_SIZE = 96
 DEFAULT_NAMESPACE = "__default__"
+PINECONE_EMBED_TOKENS_PER_MIN = int(os.getenv("PINECONE_EMBED_TOKENS_PER_MIN", "750000"))
+EMBEDDING_CHARS_PER_TOKEN = int(os.getenv("EMBEDDING_CHARS_PER_TOKEN", "4"))
+PINECONE_EMBED_MAX_RETRIES = int(os.getenv("PINECONE_EMBED_MAX_RETRIES", "5"))
+PINECONE_EMBED_RETRY_SECONDS = int(os.getenv("PINECONE_EMBED_RETRY_SECONDS", "65"))
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+class TokenPerMinuteLimiter:
+    def __init__(self, limit):
+        self.limit = limit
+        self.window_start = time.monotonic()
+        self.used = 0
+
+    def wait_for(self, tokens):
+        now = time.monotonic()
+        elapsed = now - self.window_start
+        if elapsed >= 60:
+            self.window_start = now
+            self.used = 0
+            elapsed = 0
+
+        if self.used and self.used + tokens > self.limit:
+            sleep_for = max(1, 60 - elapsed)
+            print(
+                f"Pinecone embedding token budget reached "
+                f"({self.used + tokens}/{self.limit} estimated tokens). "
+                f"Sleeping {sleep_for:.0f}s..."
+            )
+            time.sleep(sleep_for)
+            self.window_start = time.monotonic()
+            self.used = 0
+
+        self.used += tokens
+
+    def reset(self):
+        self.window_start = time.monotonic()
+        self.used = 0
+
+
+integrated_embedding_limiter = TokenPerMinuteLimiter(PINECONE_EMBED_TOKENS_PER_MIN)
+
+
+def estimate_integrated_embedding_tokens(records):
+    chars = sum(len(record.get("chunk_text", "")) for record in records)
+    return max(len(records), math.ceil(chars / EMBEDDING_CHARS_PER_TOKEN))
+
+
+def is_pinecone_rate_limit_error(exc):
+    message = str(exc)
+    return (
+        "429" in message
+        or "Too Many Requests" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "max tokens per minute" in message
+    )
+
+
+def upsert_integrated_records(index, records, label):
+    estimated_tokens = estimate_integrated_embedding_tokens(records)
+
+    for attempt in range(1, PINECONE_EMBED_MAX_RETRIES + 1):
+        integrated_embedding_limiter.wait_for(estimated_tokens)
+        try:
+            index.upsert_records(namespace=DEFAULT_NAMESPACE, records=records)
+            return
+        except Exception as exc:
+            if not is_pinecone_rate_limit_error(exc) or attempt == PINECONE_EMBED_MAX_RETRIES:
+                raise
+
+            print(
+                f"Pinecone rate limit while indexing {label} "
+                f"(attempt {attempt}/{PINECONE_EMBED_MAX_RETRIES}). "
+                f"Sleeping {PINECONE_EMBED_RETRY_SECONDS}s before retry..."
+            )
+            integrated_embedding_limiter.reset()
+            time.sleep(PINECONE_EMBED_RETRY_SECONDS)
 
 
 # --- Pinecone Setup ---
@@ -70,11 +149,23 @@ def init_news_pinecone():
 def init_job_pinecone():
     pc = Pinecone(api_key=PINECONE_API_KEY)
     if JOB_INDEX_NAME not in pc.list_indexes().names():
-        pc.create_index(
+        pc.create_index_for_model(
             name=JOB_INDEX_NAME,
-            dimension=EMBEDDING_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            cloud=CloudProvider.AWS,
+            region=AwsRegion.US_EAST_1,
+            embed={
+                "model": "llama-text-embed-v2",
+                "field_map": {"text": "chunk_text"},
+                "metric": "cosine",
+                "read_parameters": {
+                    "input_type": "query",
+                    "dimension": JOB_EMBEDDING_DIM,
+                },
+                "write_parameters": {
+                    "input_type": "passage",
+                    "dimension": JOB_EMBEDDING_DIM,
+                },
+            },
         )
         print(f"Created new Pinecone index: {JOB_INDEX_NAME}")
     else:
@@ -456,7 +547,11 @@ def index_all_products(pinecone_index):
     # Upsert in batches that fit llama-text-embed-v2 hosted embedding limits.
     for i in range(0, len(batch), PRODUCT_BATCH_SIZE):
         chunk = batch[i:i + PRODUCT_BATCH_SIZE]
-        pinecone_index.upsert_records(namespace=DEFAULT_NAMESPACE, records=chunk)
+        upsert_integrated_records(
+            pinecone_index,
+            chunk,
+            f"products batch {i // PRODUCT_BATCH_SIZE + 1}",
+        )
         print(f"Indexed {len(chunk)} products (batch {i // PRODUCT_BATCH_SIZE + 1})")
 
     print(f"Initial indexing complete: {len(batch)} products indexed")
@@ -473,7 +568,7 @@ def handle_insert_or_update(pinecone_index, product_id):
             return
         record = build_vector_record(product)
         if record:
-            pinecone_index.upsert_records(namespace=DEFAULT_NAMESPACE, records=[record])
+            upsert_integrated_records(pinecone_index, [record], f"product {product_id}")
             print(f"Upserted product {product_id} to Pinecone")
         else:
             print(f"Could not generate embedding for product {product_id}")
@@ -711,37 +806,41 @@ def fetch_all_jobs_with_microsites():
         conn.close()
 
 
+JOB_TEXT_PRIORITY_FIELDS = (
+    "id", "jobTitle", "jobId", "employerName", "description", "location",
+    "city", "state", "country", "stateId", "countryId", "salaryRange",
+    "keyResponsibilities", "qualifications", "perksBenefits", "educationLevel",
+    "certificationLevel", "interviewFormat", "requiredExperience",
+    "preferredExperience", "categoryId", "siteId", "active", "isScrapped",
+    "hideEmployer", "applicationDeadline", "createdAt", "updatedAt",
+)
+JOB_NESTED_FIELDS = {"microsite"}
+
+
 def build_job_embedding_text(job):
-    parts = []
-    if job.get("jobTitle"):
-        parts.append(job["jobTitle"])
-    if job.get("employerName"):
-        parts.append(f"Employer: {job['employerName']}")
-    if job.get("description"):
-        parts.append(job["description"][:4000])
-    if job.get("location"):
-        parts.append(f"Location: {job['location']}")
-    if job.get("keyResponsibilities"):
-        parts.append(f"Responsibilities: {job['keyResponsibilities']}")
-    if job.get("qualifications"):
-        parts.append(f"Qualifications: {job['qualifications']}")
-    if job.get("perksBenefits"):
-        parts.append(f"Benefits: {job['perksBenefits']}")
-    if job.get("educationLevel"):
-        parts.append(f"Education: {job['educationLevel']}")
-    if job.get("certificationLevel"):
-        parts.append(f"Certification: {job['certificationLevel']}")
-    if job.get("salaryRange"):
-        parts.append(f"Salary: {job['salaryRange']}")
+    lines = [
+        "record_type: job",
+        "content_format: structured key value text for semantic job search",
+    ]
 
-    # Include microsite info
-    microsite = job.get("microsite", {})
-    if microsite.get("title"):
-        parts.append(f"Company: {microsite['title']}")
-    if microsite.get("description"):
-        parts.append(microsite["description"])
+    added_keys = set()
+    for key in JOB_TEXT_PRIORITY_FIELDS:
+        if key in job and key not in JOB_NESTED_FIELDS:
+            append_embedding_line(lines, f"job.{key}", job.get(key))
+            added_keys.add(key)
 
-    return " | ".join(parts)
+    for key in sorted(job.keys()):
+        if key in added_keys or key in JOB_NESTED_FIELDS:
+            continue
+        append_embedding_line(lines, f"job.{key}", job.get(key))
+
+    microsite = job.get("microsite") or {}
+    if microsite:
+        lines.append("section: microsite employer")
+        for key in sorted(microsite.keys()):
+            append_embedding_line(lines, f"microsite.{key}", microsite.get(key))
+
+    return "\n".join(lines)
 
 
 def sanitize_job_metadata(job):
@@ -750,8 +849,9 @@ def sanitize_job_metadata(job):
     # Core job fields
     for key in ("jobTitle", "jobId", "employerName", "location", "salaryRange",
                 "educationLevel", "certificationLevel", "interviewFormat",
-                "siteId", "active", "isScrapped", "hideEmployer",
-                "image", "requiredExperience"):
+                "siteId", "active", "isScrapped", "hideEmployer", "image",
+                "requiredExperience", "city", "state", "country", "stateId",
+                "countryId"):
         val = job.get(key)
         if val is not None:
             metadata[key] = val
@@ -793,13 +893,12 @@ def sanitize_job_metadata(job):
 
 def build_job_vector_record(job):
     text = build_job_embedding_text(job)
-    embedding = generate_embedding(text)
-    if not embedding:
+    if not text.strip():
         return None
     return {
-        "id": job["id"],
-        "values": embedding,
-        "metadata": sanitize_job_metadata(job),
+        "_id": job["id"],
+        "chunk_text": text,
+        **sanitize_job_metadata(job),
     }
 
 
@@ -818,10 +917,14 @@ def index_all_jobs(job_pinecone_index):
         if record:
             batch.append(record)
 
-    for i in range(0, len(batch), 100):
-        chunk = batch[i:i + 100]
-        job_pinecone_index.upsert(vectors=chunk)
-        print(f"Indexed {len(chunk)} jobs (batch {i // 100 + 1})")
+    for i in range(0, len(batch), JOB_BATCH_SIZE):
+        chunk = batch[i:i + JOB_BATCH_SIZE]
+        upsert_integrated_records(
+            job_pinecone_index,
+            chunk,
+            f"jobs batch {i // JOB_BATCH_SIZE + 1}",
+        )
+        print(f"Indexed {len(chunk)} jobs (batch {i // JOB_BATCH_SIZE + 1})")
 
     print(f"Job indexing complete: {len(batch)} jobs indexed")
 
@@ -836,7 +939,7 @@ def handle_job_insert_or_update(job_pinecone_index, job_id):
             return
         record = build_job_vector_record(job)
         if record:
-            job_pinecone_index.upsert(vectors=[record])
+            upsert_integrated_records(job_pinecone_index, [record], f"job {job_id}")
             print(f"Upserted job {job_id} to Pinecone")
         else:
             print(f"Could not generate embedding for job {job_id}")
@@ -845,7 +948,7 @@ def handle_job_insert_or_update(job_pinecone_index, job_id):
 
 
 def handle_job_delete(job_pinecone_index, job_id):
-    job_pinecone_index.delete(ids=[job_id])
+    job_pinecone_index.delete(ids=[job_id], namespace=DEFAULT_NAMESPACE)
     print(f"Deleted job {job_id} from Pinecone")
 
 
